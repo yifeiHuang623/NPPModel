@@ -1,0 +1,38 @@
+# General settings
+model_name: ROTAN
+device: "cuda:0"
+
+# Quadkey encoder settings
+ngrams: 6
+quadkey_len: 25
+neg_num: 10
+
+# Model hyper-parameters
+poi_embed_dim: 128
+gps_embed_dim: 128
+user_embed_dim: 128
+transformer_nhid: 1024
+transformer_nlayers: 4
+transformer_nhead: 2
+transformer_dropout: 0.4
+use_deformable_attention: true
+deformable_num_points: 8
+deformable_max_distance: 128
+deformable_offset_scale: 8.0
+local_window_size: 10
+local_encoder_layers: 2
+habit_hidden_dim: 256
+route_hidden_dim: 128
+time_embed_dim: 64
+cat_embed_dim: 32
+time_loss_weight: 10
+node_attn_nhid: 128
+
+# Training hyper-parameters
+batch_size: 128
+num_epochs: 50
+patience: 10
+lr: 0.001
+lr_scheduler_factor: 0.1
+weight_decay: 0.0008
+warmup_lr_init: 0.0001

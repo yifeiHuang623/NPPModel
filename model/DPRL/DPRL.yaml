@@ -1,0 +1,26 @@
+model_name: DPRL
+device: "cuda:3"
+
+hidden_dim: 30
+lambda_t: 0.1
+weight_decay: 0.00001
+rnn: rnn
+max_sequence_length: 80
+
+batch_size: 512
+lr: 0.01
+num_epochs: 50
+patience: 20
+earsly_stop: True
+val_while_train: True
+
+lambda_s: 100
+lambda_r: 0.1
+
+cl_decay_steps: 8000
+dropout: 0.1
+lambda_user: 1.0
+lambda_loc: 1.0
+use_weight: False
+use_graph_user: False
+use_spatial_graph: False

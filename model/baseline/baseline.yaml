@@ -1,0 +1,12 @@
+# General settings
+model_name: baseline
+device: "cuda:1"
+
+# Training hyper-parameters
+batch_size: 128
+num_epochs: 50
+patience: 20
+lr: 0.001
+lr_scheduler_factor: 0.1
+weight_decay: 0.0008
+warmup_lr_init: 0.0001

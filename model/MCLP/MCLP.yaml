@@ -1,0 +1,16 @@
+model_name: MCLP
+
+device: "cuda:0"
+
+lr: 0.001
+weight_decay: 1.0e-06
+
+topic_num: 450
+
+base_dim: 16
+encoder_type: trans
+
+at_type: attn
+batch_size: 256
+num_epochs: 50
+patience: 20

@@ -1,0 +1,21 @@
+# General settings
+model_name: flashback
+device: "cuda:0"
+
+hidden_dim: 32
+lambda_t: 0.1
+# lambda_s: 100
+weight_decay: 0.0
+rnn: rnn
+max_sequence_length: 80
+
+# NYC/TKY
+batch_size: 512
+lr: 0.01
+num_epochs: 50
+patience: 20
+earsly_stop: True
+val_while_train: true
+
+# CA
+lambda_s: 1000
