@@ -19,10 +19,6 @@ use_deformable_attention: true
 deformable_num_points: 8
 deformable_max_distance: 128
 deformable_offset_scale: 8.0
-local_window_size: 10
-local_encoder_layers: 2
-habit_hidden_dim: 256
-route_hidden_dim: 128
 time_embed_dim: 64
 cat_embed_dim: 32
 time_loss_weight: 10

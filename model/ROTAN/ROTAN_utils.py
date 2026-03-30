@@ -5,6 +5,7 @@ from torch import nn
 from itertools import product
 import pandas as pd
 import numpy as np
+import torch.nn.functional as F
 
 EarthRadius = 6378137
 MinLatitude = -85.05112878
@@ -235,3 +236,93 @@ def get_quad_keys(lat, lon, permutations_dict, quadkey_len=25, ngrams=6):
     quadkey = latlng2quadkey(lat, lon, quadkey_len)
     quadkey = get_ngrams_of_quadkey(quadkey, ngrams, permutations_dict)
     return quadkey
+
+
+def rotate_batch(x, phase, dim, device=None):
+    """
+    与 rotate 接口保持一致，便于兼容你原来的代码。
+    """
+    return rotate(x, phase, dim, device=device)
+
+def _reshape_for_pairwise_rotation(x, dim):
+    """
+    x: [B, L, D]
+    取前 dim 维做二维成对旋转，要求 dim 为偶数
+    返回:
+        x_rot_even: [B, L, dim/2]
+        x_rot_odd:  [B, L, dim/2]
+        x_pass:     [B, L, D-dim]
+    """
+    assert dim % 2 == 0, f"rotary dim must be even, got {dim}"
+    assert x.size(-1) >= dim, f"input dim {x.size(-1)} < rotary dim {dim}"
+
+    x_rot = x[..., :dim]
+    x_pass = x[..., dim:]
+
+    x_rot_even = x_rot[..., 0::2]
+    x_rot_odd = x_rot[..., 1::2]
+    return x_rot_even, x_rot_odd, x_pass
+
+
+def _get_theta_from_phase(phase, dim):
+    """
+    phase: [B, L, P]
+    我们只取前 dim 维，并使用偶数位作为每个二维对的角度。
+    若 phase 的最后一维小于 dim，会报错。
+    返回:
+        theta: [B, L, dim/2]
+    """
+    assert phase.size(-1) >= dim, f"phase dim {phase.size(-1)} < rotary dim {dim}"
+    phase_rot = phase[..., :dim]
+    theta = phase_rot[..., 0::2]
+    return theta
+
+def damped_rotate(x, phase, dim, decay_rate, delta_t=None, device=None):
+    """
+    阻尼旋转：
+        y = exp(-softplus(decay_rate) * delta_t) * Rot(theta) * x
+
+    参数:
+        x: [B, L, D]
+        phase: [B, L, dim] or larger
+        dim: rotary dim, must be even
+        decay_rate:
+            - 标量参数: shape []
+            - 或 shape [dim/2]
+        delta_t:
+            - None: 无阻尼，退化成普通 rotate
+            - [B, L]
+            - [B, L, 1]
+            - [B, L, dim/2]
+    """
+    x_even, x_odd, x_pass = _reshape_for_pairwise_rotation(x, dim)
+    theta = _get_theta_from_phase(phase, dim)
+
+    cos_theta = torch.cos(theta)
+    sin_theta = torch.sin(theta)
+
+    if delta_t is None:
+        decay = 1.0
+    else:
+        if delta_t.dim() == 2:
+            delta_t = delta_t.unsqueeze(-1)
+
+        decay_rate_pos = F.softplus(decay_rate)
+
+        if decay_rate_pos.dim() == 0:
+            decay = torch.exp(-decay_rate_pos * delta_t)  # [B, L, 1] or [B, L, dim/2]
+        else:
+            decay = torch.exp(-decay_rate_pos.view(1, 1, -1) * delta_t)
+
+    y_even = decay * (x_even * cos_theta - x_odd * sin_theta)
+    y_odd = decay * (x_even * sin_theta + x_odd * cos_theta)
+
+    y = torch.stack([y_even, y_odd], dim=-1).flatten(-2)
+    return torch.cat([y, x_pass], dim=-1)
+
+
+def damped_rotate_batch(x, phase, dim, decay_rate, delta_t=None, device=None):
+    """
+    batch 版本，接口与原 rotate_batch 对齐
+    """
+    return damped_rotate(x, phase, dim, decay_rate, delta_t=delta_t, device=device)

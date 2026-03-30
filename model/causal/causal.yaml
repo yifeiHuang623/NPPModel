@@ -1,30 +1,25 @@
-# General settings
 model_name: causal
-device: "cuda:0"
 
-# Quadkey encoder settings
-ngrams: 6
-quadkey_len: 25
-neg_num: 10
+lambda_cal: 0.2
 
-# Model hyper-parameters
-poi_embed_dim: 128
-gps_embed_dim: 128
-user_embed_dim: 128
-transformer_nhid: 1024
-transformer_nlayers: 4
-transformer_nhead: 2
-transformer_dropout: 0.4
-time_embed_dim: 64
-cat_embed_dim: 32
-time_loss_weight: 10
-node_attn_nhid: 128
-
-# Training hyper-parameters
-batch_size: 128
+train_batch_size: 64
+test_batch_size: 64
 num_epochs: 50
-patience: 10
+patience: 5
+
 lr: 0.001
-lr_scheduler_factor: 0.1
-weight_decay: 0.0008
-warmup_lr_init: 0.0001
+lr_step: 2
+lr_decay: 0.1
+schedule_threshold: 0.001
+early_stop_lr: 0.000009
+
+weight_decay: 0.0001
+device: "cuda:1"
+
+user_dim: 128
+loc_dim: 32
+time_dim: 32
+region_dim: 32
+dropout: 0.5
+nhead: 1
+nlayers: 2

@@ -17,11 +17,12 @@ def evaluate(preds, gts, topk=20):
     recall = np.zeros(n, dtype=np.float32)
 
     for i in range(n):
-        pred = preds[i]
-        gt = gts[i]
+        pred = np.asarray(preds[i])
+        gt = int(gts[i])
+        pred = np.nan_to_num(pred, nan=-1e30, posinf=1e30, neginf=-1e30)
 
         # Get the indices of the top-k predictions
-        topk_indices = np.argsort(pred)[-topk:]
+        topk_indices = np.argsort(-pred, kind="stable")[:min(topk, pred.size)]
 
         # Check if the ground truth is in the top-k predictions
         if gt in topk_indices:

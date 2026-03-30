@@ -15,10 +15,13 @@ def evaluate(preds, gts, topk=20):
         pred = np.asarray(preds[i])
         gt = int(gts[i])
         assert 0 <= gt < pred.size, f"gt index out of range: {gt}"
-
-        p = 1 + int(np.count_nonzero(pred > pred[gt]))
-        if p <= min(topk, pred.size):
-            ndcg[i] = 1.0 / np.log2(p + 1)
+        pred = np.nan_to_num(pred, nan=-1e30, posinf=1e30, neginf=-1e30)
+        order = np.argsort(-pred, kind="stable")
+        topk_indices = order[:min(topk, pred.size)]
+        hit_pos = np.where(topk_indices == gt)[0]
+        if hit_pos.size > 0:
+            rank = int(hit_pos[0]) + 1
+            ndcg[i] = 1.0 / np.log2(rank + 1)
 
     return float(np.mean(ndcg))
 

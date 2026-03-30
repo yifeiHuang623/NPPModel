@@ -1,0 +1,50 @@
+model_name: moe
+
+train_batch_size: 64
+test_batch_size: 64
+num_epochs: 50
+patience: 10
+
+lr: 0.001
+lr_step: 2
+lr_decay: 0.1
+schedule_threshold: 0.001
+early_stop_lr: 0.000009
+backbone_lr_scale: 1.0
+moe_lr_scale: 1.0
+init_from_causal: false
+freeze_backbone_epochs: 0
+
+weight_decay: 0.0001
+device: "cuda:1"
+
+user_dim: 128
+loc_dim: 32
+time_dim: 32
+region_dim: 32
+dropout: 0.1
+nhead: 1
+nlayers: 2
+
+expert_hidden_dim: 48
+router_hidden_dim: 256
+routing_mode: "gumbel"
+gumbel_tau: 0.7
+top_k: 4
+router_loss_weight: 0.0005
+restart_gap_hours: 72.0
+short_horizon_hours: 3.0
+medium_horizon_hours: 18.0
+long_horizon_hours: 96.0
+time_prior_scale: 1.2
+position_prior_scale: 1.5
+scene_prior_scale: 1.0
+expert_residual_scale: 0.1
+memory_bias_scale: 0.03
+expert_warmup_epochs: 5
+router_tau_start: 1.5
+router_tau_end: 1.0
+user_prior_scale: 0.5
+token_refine_scale: 0.08
+grad_clip_norm: 1.0
+label_smoothing: 0.1

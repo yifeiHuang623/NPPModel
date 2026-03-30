@@ -8,7 +8,7 @@ import shutil, os
 from utils.logger import get_logger
 from types import SimpleNamespace
 
-from .ROTAN import ROTAN
+from .AdaptiveRotary import ROTAN
 from utils.EarlyStopping import EarlyStopping
 from tqdm import tqdm
 from utils.register import EVAL_REGISTRY
