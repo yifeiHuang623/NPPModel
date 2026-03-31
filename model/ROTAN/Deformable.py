@@ -113,8 +113,7 @@ class IntervalAdaptiveGate(nn.Module):
 
     def forward(self, base_x, rotated_x, delta_t, delta_bucket=None):
         if delta_t is None:
-            gate = 0.5
-            return gate * rotated_x + (1.0 - gate) * base_x
+            return 0.5 * rotated_x + 0.5 * base_x
 
         if delta_t.dim() == 1:
             delta_t = delta_t.unsqueeze(-1)
@@ -141,10 +140,12 @@ class IntervalAdaptiveGate(nn.Module):
 class RotaryAdaptiveFusion(nn.Module):
     def __init__(self, embed_dim, rot_dim, hidden_dim=None, gate_hidden_dim=None, bucket_emb_dim=16, dropout=0.1):
         super().__init__()
+        self.embed_dim = embed_dim
         self.rot_dim = rot_dim
         self.hour_logit = nn.Parameter(torch.tensor(0.7))
         self.day_logit = nn.Parameter(torch.tensor(0.3))
         self.bucketizer = DeltaBucketizer()
+
         gate_hidden_dim = gate_hidden_dim if gate_hidden_dim is not None else embed_dim
         self.hour_gate = IntervalAdaptiveGate(embed_dim, 9, bucket_emb_dim, gate_hidden_dim, dropout)
         self.day_gate = IntervalAdaptiveGate(embed_dim, 9, bucket_emb_dim, gate_hidden_dim, dropout)
@@ -163,10 +164,12 @@ class RotaryAdaptiveFusion(nn.Module):
 class RotaryAdaptiveFusionBatch(nn.Module):
     def __init__(self, embed_dim, rot_dim, hidden_dim=None, gate_hidden_dim=None, bucket_emb_dim=16, dropout=0.1):
         super().__init__()
+        self.embed_dim = embed_dim
         self.rot_dim = rot_dim
         self.hour_logit = nn.Parameter(torch.tensor(0.7))
         self.day_logit = nn.Parameter(torch.tensor(0.3))
         self.bucketizer = DeltaBucketizer()
+
         gate_hidden_dim = gate_hidden_dim if gate_hidden_dim is not None else embed_dim
         self.hour_gate = IntervalAdaptiveGate(embed_dim, 9, bucket_emb_dim, gate_hidden_dim, dropout)
         self.day_gate = IntervalAdaptiveGate(embed_dim, 9, bucket_emb_dim, gate_hidden_dim, dropout)
@@ -182,182 +185,50 @@ class RotaryAdaptiveFusionBatch(nn.Module):
         return weights[0] * hour_out + weights[1] * day_out
 
 
-class DeformableHistoryAttention(nn.Module):
-    def __init__(self, embed_dim, num_heads, num_points, max_distance, offset_scale, dropout=0.1):
+class BiasAwareRoutingHead(nn.Module):
+    def __init__(self, hidden_dim, num_pois, dropout=0.1):
         super().__init__()
-        self.embed_dim = embed_dim
-        self.num_heads = num_heads
-        self.num_points = num_points
-        self.max_distance = max_distance
-        self.offset_scale = offset_scale
-
-        self.q_proj = nn.Linear(embed_dim, embed_dim)
-        self.k_proj = nn.Linear(embed_dim, embed_dim)
-        self.v_proj = nn.Linear(embed_dim, embed_dim)
-        self.out_proj = nn.Linear(embed_dim, embed_dim)
-        self.offset_mlp = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim),
-            nn.GELU(),
-            nn.Linear(embed_dim, num_heads * num_points),
-        )
-        self.dropout = nn.Dropout(dropout)
-
-        anchors = torch.linspace(0.1, 0.9, num_points)
-        self.register_buffer("anchors", anchors)
-
-    def _build_sample_positions(self, x, padding_mask):
-        bsz, seq_len, _ = x.shape
-        device = x.device
-        valid_len = seq_len - padding_mask.sum(dim=-1)
-        valid_len = valid_len.clamp_min(1)
-
-        positions = torch.arange(seq_len, device=device).view(1, seq_len, 1).expand(bsz, seq_len, self.num_points)
-        base = self.anchors.view(1, 1, self.num_points) * positions.to(torch.float)
-        offsets = torch.tanh(self.offset_mlp(x)).view(bsz, seq_len, self.num_heads, self.num_points)
-        offsets = offsets.mean(dim=2) * self.offset_scale
-        sampled = base + offsets
-
-        min_allowed = torch.clamp(positions - self.max_distance, min=0).to(torch.float)
-        max_allowed = positions.to(torch.float)
-        sampled = torch.maximum(sampled, min_allowed)
-        sampled = torch.minimum(sampled, max_allowed)
-
-        per_batch_max = (valid_len - 1).view(bsz, 1, 1).to(torch.float)
-        sampled = torch.minimum(sampled, per_batch_max)
-        return sampled.round().long()
-
-    def forward(self, x, padding_mask, extra_invalid_mask=None):
-        bsz, seq_len, _ = x.shape
-        sampled_pos = self._build_sample_positions(x, padding_mask)
-
-        k = self.k_proj(x)
-        v = self.v_proj(x)
-        q = self.q_proj(x)
-
-        gather_index = sampled_pos.unsqueeze(-1).expand(-1, -1, -1, self.embed_dim)
-        k_sparse = torch.gather(k.unsqueeze(1).expand(-1, seq_len, -1, -1), 2, gather_index)
-        v_sparse = torch.gather(v.unsqueeze(1).expand(-1, seq_len, -1, -1), 2, gather_index)
-
-        scores = (q.unsqueeze(2) * k_sparse).sum(dim=-1) / math.sqrt(self.embed_dim)
-
-        sampled_invalid = torch.gather(
-            padding_mask.unsqueeze(1).expand(-1, seq_len, -1),
-            2,
-            sampled_pos,
-        )
-        query_pos = torch.arange(seq_len, device=x.device).view(1, seq_len, 1)
-        causal_invalid = sampled_pos > query_pos
-        invalid_mask = sampled_invalid | causal_invalid
-        if extra_invalid_mask is not None:
-            extra_invalid = torch.gather(
-                extra_invalid_mask.unsqueeze(0).expand(bsz, -1, -1),
-                2,
-                sampled_pos,
-            )
-            invalid_mask = invalid_mask | extra_invalid
-        scores = scores.masked_fill(invalid_mask, float("-inf"))
-
-        all_invalid = torch.isinf(scores).all(dim=-1, keepdim=True)
-        scores = scores.masked_fill(all_invalid, 0.0)
-        attn = torch.softmax(scores, dim=-1)
-        attn = attn.masked_fill(invalid_mask, 0.0)
-        attn = self.dropout(attn)
-        out = (attn.unsqueeze(-1) * v_sparse).sum(dim=2)
-        return self.out_proj(out)
-
-
-class ShortLongDeformableBlock(nn.Module):
-    def __init__(
-        self,
-        embed_dim,
-        num_heads,
-        hidden_dim,
-        dropout,
-        num_points,
-        max_distance,
-        offset_scale,
-        local_window=4,
-        short_term_len=4,
-    ):
-        super().__init__()
-        self.local_window = local_window
-        self.short_term_len = short_term_len
-        self.local_attn = nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout, batch_first=True)
-        self.long_attn = DeformableHistoryAttention(embed_dim, num_heads, num_points, max_distance, offset_scale, dropout=dropout)
-        self.gate = nn.Sequential(
-            nn.Linear(embed_dim * 3, embed_dim),
+        self.preference_memory = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(embed_dim, embed_dim),
+            nn.Linear(hidden_dim, hidden_dim),
         )
-        self.norm1 = nn.LayerNorm(embed_dim)
-        self.norm2 = nn.LayerNorm(embed_dim)
-        self.ffn = nn.Sequential(
-            nn.Linear(embed_dim, hidden_dim),
+        self.dynamic_proj = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, embed_dim),
-            nn.Dropout(dropout),
         )
+        self.routing_gate = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.dynamic_head = nn.Linear(hidden_dim, num_pois)
+        self.preference_head = nn.Linear(hidden_dim, num_pois)
 
-    def _local_causal_mask(self, seq_len, device):
-        pos = torch.arange(seq_len, device=device)
-        future = pos.view(1, -1) > pos.view(-1, 1)
-        short_window = min(self.local_window, self.short_term_len)
-        too_far = (pos.view(-1, 1) - pos.view(1, -1)) >= short_window
-        return future | too_far
+    def _build_preference_context(self, seq_repr, padding_mask):
+        valid = (~padding_mask).to(seq_repr.dtype)
+        prefix_sum = torch.cumsum(seq_repr * valid.unsqueeze(-1), dim=1)
+        prefix_cnt = torch.cumsum(valid, dim=1)
+        pref_ctx = prefix_sum / prefix_cnt.clamp_min(1.0).unsqueeze(-1)
+        pref_ctx = pref_ctx.masked_fill(padding_mask.unsqueeze(-1), 0.0)
+        return self.preference_memory(pref_ctx)
 
-    def _long_memory_mask(self, seq_len, device):
-        pos = torch.arange(seq_len, device=device)
-        recent_boundary = pos.view(-1, 1) - (self.short_term_len - 1)
-        return pos.view(1, -1) >= torch.clamp(recent_boundary, min=0)
+    def forward(self, seq_repr, padding_mask):
+        seq_repr = seq_repr.masked_fill(padding_mask.unsqueeze(-1), 0.0)
+        dynamic_state = self.dynamic_proj(seq_repr)
+        preference_state = self._build_preference_context(seq_repr, padding_mask)
 
-    def forward(self, x, padding_mask):
-        local_mask = self._local_causal_mask(x.size(1), x.device)
-        local_out, _ = self.local_attn(x, x, x, attn_mask=local_mask, key_padding_mask=padding_mask, need_weights=False)
-        long_memory_mask = self._long_memory_mask(x.size(1), x.device)
-        long_out = self.long_attn(x, padding_mask, extra_invalid_mask=long_memory_mask)
-        gate = torch.sigmoid(self.gate(torch.cat([x, local_out, long_out], dim=-1)))
-        fused = gate * local_out + (1.0 - gate) * long_out
-        x = self.norm1(x + fused)
-        x = self.norm2(x + self.ffn(x))
-        return x
+        gate = torch.sigmoid(self.routing_gate(torch.cat([dynamic_state, preference_state], dim=-1)))
+        gate = gate.masked_fill(padding_mask.unsqueeze(-1), 0.0)
 
-
-class ShortLongDeformableEncoder(nn.Module):
-    def __init__(
-        self,
-        embed_dim,
-        num_heads,
-        hidden_dim,
-        num_layers,
-        dropout,
-        num_points,
-        max_distance,
-        offset_scale,
-        local_window=4,
-        short_term_len=4,
-    ):
-        super().__init__()
-        self.layers = nn.ModuleList([
-            ShortLongDeformableBlock(
-                embed_dim=embed_dim,
-                num_heads=num_heads,
-                hidden_dim=hidden_dim,
-                dropout=dropout,
-                num_points=num_points,
-                max_distance=max_distance,
-                offset_scale=offset_scale,
-                local_window=local_window,
-                short_term_len=short_term_len,
-            )
-            for _ in range(num_layers)
-        ])
-
-    def forward(self, x, padding_mask):
-        for layer in self.layers:
-            x = layer(x, padding_mask)
-        return x
+        dynamic_logits = self.dynamic_head(dynamic_state)
+        preference_logits = self.preference_head(preference_state)
+        routed_logits = gate * dynamic_logits + (1.0 - gate) * preference_logits
+        routed_logits = routed_logits.masked_fill(padding_mask.unsqueeze(-1), 0.0)
+        return routed_logits
 
 
 class ROTAN(nn.Module):
@@ -389,18 +260,14 @@ class ROTAN(nn.Module):
         self.hidden_size = args.transformer_nhid
 
         self.pos_encoder1 = RightPositionalEncoding(self.user_fused_dim, self.dropout)
-        self.transformer_encoder1 = ShortLongDeformableEncoder(
-            embed_dim=self.user_fused_dim,
-            num_heads=self.n_head,
-            hidden_dim=self.hidden_size,
-            num_layers=self.n_layers,
-            dropout=self.dropout,
-            num_points=getattr(args, "deformable_num_points", 8),
-            max_distance=getattr(args, "deformable_max_distance", 128),
-            offset_scale=getattr(args, "deformable_offset_scale", 8.0),
-            local_window=getattr(args, "deformable_local_window", 4),
-            short_term_len=getattr(args, "short_term_len", 4),
+        encoder_layers1 = TransformerEncoderLayer(
+            self.user_fused_dim,
+            self.n_head,
+            self.hidden_size,
+            self.dropout,
+            batch_first=True
         )
+        self.transformer_encoder1 = TransformerEncoder(encoder_layers1, self.n_layers)
 
         self.history_time_fusion = RotaryAdaptiveFusion(
             embed_dim=self.user_fused_dim,
@@ -408,19 +275,26 @@ class ROTAN(nn.Module):
             hidden_dim=self.user_fused_dim,
             gate_hidden_dim=self.user_fused_dim,
             bucket_emb_dim=16,
-            dropout=self.dropout,
+            dropout=self.dropout
         )
+
         self.target_time_fusion = RotaryAdaptiveFusionBatch(
             embed_dim=self.user_fused_dim,
             rot_dim=self.user_rot_dim,
             hidden_dim=self.user_fused_dim,
             gate_hidden_dim=self.user_fused_dim,
             bucket_emb_dim=16,
-            dropout=self.dropout,
+            dropout=self.dropout
         )
 
+        self.routing_head = BiasAwareRoutingHead(
+            hidden_dim=self.user_fused_dim + self.poi_embed_dim,
+            num_pois=args.num_pois,
+            dropout=self.dropout,
+        )
         self.decoder_poi1 = nn.Linear(self.user_fused_dim + self.poi_embed_dim, args.num_pois)
         self.criterion_poi = nn.CrossEntropyLoss(ignore_index=0)
+
         self.init_weights()
 
     def init_weights(self):
@@ -429,21 +303,30 @@ class ROTAN(nn.Module):
         self.decoder_poi1.weight.data.uniform_(-initrange, initrange)
 
     def _build_causal_mask(self, seq_len):
-        return torch.triu(torch.full((seq_len, seq_len), float("-inf"), device=self.device), diagonal=1)
+        return torch.triu(
+            torch.full((seq_len, seq_len), float("-inf"), device=self.device),
+            diagonal=1
+        )
 
     def _get_time_delta(self, batch_data, key="time_delta", target=False):
         if not target:
             if key in batch_data:
                 return batch_data[key].to(torch.float)
             return None
-        if "y_POI_id" in batch_data and key in batch_data["y_POI_id"]:
-            return batch_data["y_POI_id"][key].to(torch.float)
-        return None
+        else:
+            if "y_POI_id" in batch_data and key in batch_data["y_POI_id"]:
+                return batch_data["y_POI_id"][key].to(torch.float)
+            return None
 
     def compute_poi_prob(self, src1, src_mask, target_hour, target_day, poi_embeds, src_key_mask, target_delta=None):
         src1 = src1 * math.sqrt(self.user_fused_dim)
         src1 = self.pos_encoder1(src1)
-        src1 = self.transformer_encoder1(src1, src_key_mask)
+        src1 = self.transformer_encoder1(
+            src=src1,
+            mask=src_mask,
+            src_key_padding_mask=src_key_mask
+        )
+
         src1 = self.target_time_fusion(
             src1,
             target_hour,
@@ -451,10 +334,14 @@ class ROTAN(nn.Module):
             rotate_batch_fn=rotate_batch,
             device=self.device,
             hour_delta=target_delta,
-            day_delta=target_delta,
+            day_delta=target_delta
         )
-        src1 = torch.cat((src1, poi_embeds), dim=-1)
-        return self.decoder_poi1(src1)
+
+        fused_state = torch.cat((src1, poi_embeds), dim=-1)
+        base_logits = self.decoder_poi1(fused_state)
+        routed_logits = self.routing_head(fused_state, src_key_mask)
+        out_poi_prob = base_logits + routed_logits
+        return out_poi_prob
 
     def handle_sequence(self, batch_data):
         poi_id = batch_data["POI_id"]
@@ -462,7 +349,10 @@ class ROTAN(nn.Module):
         day_time = batch_data["day_time"]
         seq_len = batch_data["mask"]
 
-        user_id = batch_data["user_id"].unsqueeze(dim=1).expand(poi_id.shape[0], poi_id.shape[1])
+        user_id = batch_data["user_id"].unsqueeze(dim=1).expand(
+            poi_id.shape[0], poi_id.shape[1]
+        )
+
         y_poi_id = batch_data["y_POI_id"]["POI_id"]
         y_norm_time = batch_data["y_POI_id"]["norm_time"]
         y_day_time = batch_data["y_POI_id"]["day_time"]
@@ -482,21 +372,34 @@ class ROTAN(nn.Module):
             end = seq_len[i].item()
             if end <= 0:
                 continue
-            y_poi_seq[i, :end] = torch.cat((poi_id[i, 1:end], y_poi_id[i].unsqueeze(dim=-1)), dim=-1)
-            y_norm_time_seq[i, :end] = torch.cat((norm_time[i, 1:end], y_norm_time[i].unsqueeze(dim=-1)), dim=-1)
-            y_day_time_seq[i, :end] = torch.cat((day_time[i, 1:end], y_day_time[i].unsqueeze(dim=-1)), dim=-1)
+
+            y_poi_seq[i, :end] = torch.cat(
+                (poi_id[i, 1:end], y_poi_id[i].unsqueeze(dim=-1)), dim=-1
+            )
+            y_norm_time_seq[i, :end] = torch.cat(
+                (norm_time[i, 1:end], y_norm_time[i].unsqueeze(dim=-1)), dim=-1
+            )
+            y_day_time_seq[i, :end] = torch.cat(
+                (day_time[i, 1:end], y_day_time[i].unsqueeze(dim=-1)), dim=-1
+            )
+
             if has_delta:
-                time_delta_seq[i, :end] = torch.cat((time_delta[i, 1:end], y_time_delta[i].unsqueeze(dim=-1)), dim=-1)
+                time_delta_seq[i, :end] = torch.cat(
+                    (time_delta[i, 1:end], y_time_delta[i].unsqueeze(dim=-1)), dim=-1
+                )
 
         batch_data["user_id"] = user_id
         batch_data["y_POI_id"]["POI_id"] = y_poi_seq
         batch_data["y_POI_id"]["norm_time"] = y_norm_time_seq
         batch_data["y_POI_id"]["day_time"] = y_day_time_seq
+
         if has_delta:
             batch_data["y_POI_id"]["time_delta"] = time_delta_seq
 
         lengths = batch_data["mask"]
-        indices = torch.arange(user_id.shape[1], device=self.device).unsqueeze(0).expand(user_id.shape[0], user_id.shape[1])
+        indices = torch.arange(user_id.shape[1], device=self.device).unsqueeze(0).expand(
+            user_id.shape[0], user_id.shape[1]
+        )
         padding_mask = (indices >= lengths.unsqueeze(1)).to(torch.bool)
         batch_data["mask"] = padding_mask
         batch_data["seq_len"] = lengths
@@ -504,12 +407,16 @@ class ROTAN(nn.Module):
 
     def get_predict(self, batch_data):
         batch_data = self.handle_sequence(batch_data)
+
         seq_len = batch_data["POI_id"].size(1)
         src_mask = self._build_causal_mask(seq_len)
+
         x1, batch_target_time, batch_target_day, poi_embeds_padded, target_delta = self.get_rotation_and_loss(
             batch_data, src_mask, batch_data["mask"]
         )
+
         y_poi = batch_data["y_POI_id"]["POI_id"]
+
         y_pred_poi = self.compute_poi_prob(
             x1,
             src_mask,
@@ -517,28 +424,35 @@ class ROTAN(nn.Module):
             batch_target_day,
             poi_embeds_padded,
             batch_data["mask"],
-            target_delta=target_delta,
+            target_delta=target_delta
         )
+
         return y_pred_poi, y_poi
 
     def forward(self, batch_data):
         y_pred_poi, y_poi = self.get_predict(batch_data)
-        return self.criterion_poi(y_pred_poi.transpose(1, 2), y_poi)
+        loss_poi = self.criterion_poi(y_pred_poi.transpose(1, 2), y_poi)
+        return loss_poi
 
     def predict(self, batch_data):
         y_pred_poi, _ = self.get_predict(batch_data)
+
         padding_mask = batch_data["mask"]
         valid_len = y_pred_poi.shape[1] - torch.sum(padding_mask, dim=-1)
+
         batch_indices = torch.arange(valid_len.shape[0], device=self.device)
-        return y_pred_poi[batch_indices, valid_len - 1]
+        y_pred = y_pred_poi[batch_indices, valid_len - 1]
+        return y_pred
 
     def get_rotation_and_loss(self, batch_data, mask, src_key_mask):
         u_id = batch_data["user_id"]
         poi_id = batch_data["POI_id"]
         time = batch_data["norm_time"].to(torch.float)
         day_time = batch_data["day_time"].to(torch.float)
+
         target_time = batch_data["y_POI_id"]["norm_time"].to(torch.float)
         target_day_time = batch_data["y_POI_id"]["day_time"].to(torch.float)
+
         time_delta = self._get_time_delta(batch_data, key="time_delta", target=False)
         target_time_delta = self._get_time_delta(batch_data, key="time_delta", target=True)
 
@@ -548,10 +462,12 @@ class ROTAN(nn.Module):
 
         user_times = self.time_embed_model_user(time)
         user_day_times = self.time_embed_model_user_day(day_time)
+
         user_next_times = self.time_embed_model_user_tgt(target_time)
         user_next_day_times = self.time_embed_model_user_day_tgt(target_day_time)
 
         user_embeddings = torch.cat((user_embeddings, seq_poi_embeddings), dim=-1)
+
         seq_embedding1 = self.history_time_fusion(
             user_embeddings,
             user_times,
@@ -559,7 +475,7 @@ class ROTAN(nn.Module):
             rotate_fn=rotate,
             device=self.device,
             hour_delta=time_delta,
-            day_delta=time_delta,
+            day_delta=time_delta
         )
 
         return seq_embedding1, user_next_times, user_next_day_times, poi_embeds, target_time_delta

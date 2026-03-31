@@ -293,6 +293,7 @@ class BaseDataLoader:
     ) -> None:
 
         model_args = model_args or {}
+        args = args or {}
 
         # 1) preprocess 出 raw_df（只做一次）
         raw_df = MyDataset.preprocess_func()
@@ -322,19 +323,41 @@ class BaseDataLoader:
             test_df = raw_df.iloc[n_train + n_val:]
 
         split_path = f"./data/{dataset_name.split('_')[0]}/{dataset_name.split('_')[0]}_valtest_rowids.json"
+
+        intersection_params = {
+            "max_gap_seconds": args.get("max_gap_seconds", model_args.get("max_gap_seconds", 86400)),
+            "fixed_len": args.get("fixed_len", model_args.get("fixed_len", 20)),
+            "sequence_length": args.get("sequence_length", model_args.get("sequence_length", 30)),
+            "recent_k": model_args.get("recent_k", args.get("recent_k", 100)),
+        }
+
+        need_rebuild_split = True
         if os.path.exists(split_path):
             loaded = load_valtest_rowids(split_path)
-            allowed_val = loaded["val_rowids"]
-            allowed_test = loaded["test_rowids"]
-            logger.info("Loaded val/test row_id file: %s (val=%d test=%d)", split_path, len(allowed_val), len(allowed_test))
-        else:
+            loaded_params = (loaded.get("meta", {}) or {}).get("params", {})
+            if loaded_params == intersection_params:
+                allowed_val = loaded["val_rowids"]
+                allowed_test = loaded["test_rowids"]
+                need_rebuild_split = False
+                logger.info("Loaded val/test row_id file: %s (val=%d test=%d)", split_path, len(allowed_val), len(allowed_test))
+            else:
+                logger.info(
+                    "Existing val/test row_id file params mismatch, rebuilding: %s old=%s new=%s",
+                    split_path,
+                    loaded_params,
+                    intersection_params,
+                )
+
+        if need_rebuild_split:
             allowed_val, allowed_test, meta = build_valtest_rowids_intersection(
                 raw_df=raw_df,
                 train_df=train_df,
                 val_df=val_df,
                 test_df=test_df,
-                max_gap_seconds=model_args.get("max_gap_seconds", 86400),
-                fixed_len=model_args.get("fixed_len", 20),
+                max_gap_seconds=intersection_params["max_gap_seconds"],
+                fixed_len=intersection_params["fixed_len"],
+                sequence_length=intersection_params["sequence_length"],
+                recent_k=intersection_params["recent_k"],
             )
             save_valtest_rowids(split_path, allowed_val, allowed_test, meta=meta)
             logger.info("Saved val/test row_id file: %s meta=%s", split_path, meta)
