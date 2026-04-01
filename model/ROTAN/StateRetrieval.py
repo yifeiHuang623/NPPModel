@@ -112,6 +112,50 @@ class AdaptiveStateMixer(nn.Module):
         return retrieved, attn
 
 
+class BiasAwareRoutingHead(nn.Module):
+    def __init__(self, hidden_dim, num_pois, dropout=0.1):
+        super().__init__()
+        self.preference_memory = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.dynamic_proj = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.routing_gate = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.dynamic_head = nn.Linear(hidden_dim, num_pois)
+        self.preference_head = nn.Linear(hidden_dim, num_pois)
+
+    def _build_preference_context(self, seq_repr, padding_mask):
+        valid = (~padding_mask).to(seq_repr.dtype)
+        prefix_sum = torch.cumsum(seq_repr * valid.unsqueeze(-1), dim=1)
+        prefix_cnt = torch.cumsum(valid, dim=1)
+        pref_ctx = prefix_sum / prefix_cnt.clamp_min(1.0).unsqueeze(-1)
+        pref_ctx = pref_ctx.masked_fill(padding_mask.unsqueeze(-1), 0.0)
+        return self.preference_memory(pref_ctx)
+
+    def forward(self, seq_repr, padding_mask):
+        seq_repr = seq_repr.masked_fill(padding_mask.unsqueeze(-1), 0.0)
+        dynamic_state = self.dynamic_proj(seq_repr)
+        preference_state = self._build_preference_context(seq_repr, padding_mask)
+        gate = torch.sigmoid(self.routing_gate(torch.cat([dynamic_state, preference_state], dim=-1)))
+        gate = gate.masked_fill(padding_mask.unsqueeze(-1), 0.0)
+
+        dynamic_logits = self.dynamic_head(dynamic_state)
+        preference_logits = self.preference_head(preference_state)
+        routed_logits = gate * dynamic_logits + (1.0 - gate) * preference_logits
+        return routed_logits.masked_fill(padding_mask.unsqueeze(-1), 0.0)
+
+
 class ROTAN(nn.Module):
     def __init__(self, args):
         super().__init__()
@@ -141,6 +185,11 @@ class ROTAN(nn.Module):
         self.retriever = AdaptiveStateMixer(hidden_dim=self.hidden_size, dropout=self.dropout)
         self.direct_head = nn.Linear(self.hidden_size, args.num_pois)
         self.retrieve_head = nn.Linear(self.hidden_size, args.num_pois)
+        self.routing_head = BiasAwareRoutingHead(
+            hidden_dim=self.hidden_size * 2,
+            num_pois=args.num_pois,
+            dropout=self.dropout,
+        )
         self.fusion_gate = nn.Sequential(
             nn.Linear(self.hidden_size * 2, self.hidden_size),
             nn.GELU(),
@@ -192,6 +241,9 @@ class ROTAN(nn.Module):
         gate = gate.masked_fill(src_key_mask.unsqueeze(-1), 0.0)
 
         logits = gate * direct_logits + (1.0 - gate) * retrieve_logits
+        fused_state = torch.cat([query_state, retrieved], dim=-1)
+        routed_logits = self.routing_head(fused_state, src_key_mask)
+        logits = logits + routed_logits
         logits = logits.masked_fill(src_key_mask.unsqueeze(-1), 0.0)
         return logits
 
